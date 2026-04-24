@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxTableExtension xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+    <Name>SampleOrderTable.SampleExtModel</Name>
+    <Fields>
+        <AxTableField xmlns="" i:type="AxTableFieldString">
+            <Name>ExtraField</Name>
+            <ExtendedDataType>SampleEdt</ExtendedDataType>
+        </AxTableField>
+    </Fields>
+    <Relations>
+        <AxTableRelation>
+            <Name>AnotherTable</Name>
+            <Table>AnotherTable</Table>
+        </AxTableRelation>
+    </Relations>
+    <Indexes />
+</AxTableExtension>

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxAggregateMeasurement xmlns:i="http://www.w3.org/2001/XMLSchema-instance"
+    xmlns="Microsoft.Dynamics.AX.Metadata.V2">
+    <Name>SampleSalesAnalysis</Name>
+    <Label>@Sample:SalesAnalysis</Label>
+    <MeasureGroups>
+        <AxMeasureGroup xmlns="">
+            <Name>SalesLines</Name>
+            <Table>SampleOrderTable</Table>
+            <Dimensions>
+                <AxDimension>
+                    <Name>Company</Name>
+                    <DimensionName>Company</DimensionName>
+                </AxDimension>
+            </Dimensions>
+        </AxMeasureGroup>
+    </MeasureGroups>
+</AxAggregateMeasurement>

@@ -14,6 +14,7 @@ class FileType(str, Enum):
     PAPER = "paper"
     IMAGE = "image"
     VIDEO = "video"
+    XPP = "xpp"
 
 
 _MANIFEST_PATH = "graphify-out/manifest.json"
@@ -24,6 +25,27 @@ PAPER_EXTENSIONS = {'.pdf'}
 IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg'}
 OFFICE_EXTENSIONS = {'.docx', '.xlsx'}
 VIDEO_EXTENSIONS = {'.mp4', '.mov', '.webm', '.mkv', '.avi', '.m4v', '.mp3', '.wav', '.m4a', '.ogg'}
+
+# D365 F&O / X++ metadata artifacts stored as XML files.
+# Each file has a root element matching one of these tags.
+XPP_ARTIFACT_TAGS = frozenset({
+    "AxClass", "AxTable", "AxTableExtension",
+    "AxForm", "AxFormExtension",
+    "AxView", "AxViewExtension",
+    "AxDataEntityView", "AxDataEntityViewExtension",
+    "AxMap",
+    "AxQuery", "AxQuerySimpleExtension",
+    "AxEnum", "AxEnumExtension",
+    "AxEdt",
+    "AxSecurityPrivilege", "AxSecurityDuty", "AxSecurityDutyExtension",
+    "AxSecurityRole", "AxSecurityRoleExtension",
+    "AxMenuItemDisplay", "AxMenuItemAction", "AxMenuItemOutput", "AxMenuExtension",
+    "AxTile",
+    "AxService", "AxServiceGroup",
+    "AxAggregateMeasurement", "AxAggregateDimension", "AxAggregateDataEntity",
+    "AxKPI",
+    "AxConfigurationKey", "AxReport", "AxResource", "AxMacroDictionary",
+})
 
 CORPUS_WARN_THRESHOLD = 50_000    # words - below this, warn "you may not need a graph"
 CORPUS_UPPER_THRESHOLD = 500_000  # words - above this, warn about token cost
@@ -64,6 +86,21 @@ def _is_sensitive(path: Path) -> bool:
     return any(p.search(name) for p in _SENSITIVE_PATTERNS)
 
 
+def is_xpp_file(path: Path) -> bool:
+    """Return True if path is a D365 F&O XML metadata file (AxClass, AxTable, etc.).
+
+    Reads only the first 512 bytes to locate the root element tag — fast enough
+    to call on every .xml file during collection without parsing the full DOM.
+    """
+    try:
+        header = path.read_bytes()[:512].decode("utf-8", errors="ignore")
+        # Look for an <AxXxx> opening tag (with optional namespace attribute)
+        m = re.search(r"<(Ax[A-Za-z]+)[\s>]", header)
+        return m is not None and m.group(1) in XPP_ARTIFACT_TAGS
+    except Exception:
+        return False
+
+
 def _looks_like_paper(path: Path) -> bool:
     """Heuristic: does this text file read like an academic paper?"""
     try:
@@ -85,6 +122,9 @@ def classify_file(path: Path) -> FileType | None:
     ext = path.suffix.lower()
     if ext in CODE_EXTENSIONS:
         return FileType.CODE
+    # .xml files may be D365 F&O X++ metadata — check before falling through
+    if ext == ".xml" and is_xpp_file(path):
+        return FileType.XPP
     if ext in PAPER_EXTENSIONS:
         # PDFs inside Xcode asset catalogs are vector icons, not papers
         if any(part.endswith(tuple(_ASSET_DIR_MARKERS)) for part in path.parts):
@@ -342,6 +382,7 @@ def detect(root: Path, *, follow_symlinks: bool = False) -> dict:
         FileType.PAPER: [],
         FileType.IMAGE: [],
         FileType.VIDEO: [],
+        FileType.XPP: [],
     }
     total_words = 0
 

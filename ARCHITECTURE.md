@@ -62,6 +62,35 @@ Every extractor returns:
 4. Add the tree-sitter package to `pyproject.toml` dependencies.
 5. Add a fixture file to `tests/fixtures/` and tests to `tests/test_languages.py`.
 
+### Adding a new XML-based extractor (e.g. another metadata format)
+
+For languages without a tree-sitter grammar that store code inside XML (like D365 F&O / X++):
+
+1. Add the root element tag(s) to `XPP_ARTIFACT_TAGS` in `detect.py`.
+2. Implement a handler function in `extract.py` — use `xml.etree.ElementTree` to parse the XML and regex on any embedded CDATA source blocks.
+3. Dispatch to the handler from `extract_xpp()` (or add a new top-level extractor if the format is unrelated to X++).
+4. The `.xml` extension is already wired into `collect_files()` and `extract()` dispatch via `is_xpp_file()`. New tags in `XPP_ARTIFACT_TAGS` are automatically detected.
+5. Add fixture XML files to `tests/fixtures/xpp/` and tests to `tests/test_xpp.py`.
+
+## X++ / Dynamics 365 F&O Support
+
+graphify supports D365 F&O X++ metadata stored as XML files under `Metadata/` directories. The extractor (`extract_xpp` in `extract.py`) handles **40 artifact types** across 8 tiers:
+
+| Tier | Artifact Types | Key Edges Produced |
+|------|---------------|--------------------|
+| Code | AxClass, AxTable, AxForm, AxView, AxDataEntityView, AxMap, AxQuery | `extends`, `defines_method`, `calls`, `uses_table`, `uses_field`, `references_enum`, `data_source`, `join` |
+| Extensions | AxTableExtension, AxFormExtension, AxDataEntityViewExtension, AxViewExtension, AxQuerySimpleExtension, AxEnumExtension | `extends`, `field_of`, `relation_to` |
+| Types | AxEnum, AxEnumExtension, AxEdt | `value_of`, `table_reference` |
+| Security | AxSecurityPrivilege, AxSecurityDuty, AxSecurityRole + extensions | `grants_access_to`, `includes_privilege`, `has_duty`, `has_sub_role` |
+| UI / Navigation | AxMenuItemDisplay/Action/Output, AxMenuExtension, AxTile | `opens_form`, `runs_class`, `launches`, `includes_tile` |
+| Services | AxService, AxServiceGroup | `implemented_by`, `exposes_method`, `includes_service` |
+| BI / Analytics | AxAggregateMeasurement, AxAggregateDimension, AxAggregateDataEntity, AxKPI | `measure_group_of`, `uses_table`, `has_dimension`, `measures_from` |
+| Config / Meta | AxConfigurationKey, AxReport, AxResource, AxMacroDictionary, AxEdt | node-only |
+
+**Detection**: `detect.py` uses `is_xpp_file(path)` which reads the first 512 bytes and checks for an `<Ax...>` root element tag in `XPP_ARTIFACT_TAGS`. The `FileType.XPP` enum value is used for these files.
+
+**Parsing**: No tree-sitter grammar exists for X++. The extractor uses `xml.etree.ElementTree` for structure and regex patterns on `<Source><![CDATA[...]]>` sections for call analysis (`::` static calls, `->` instance calls, `new ClassName()`, `tableStr()`, `fieldStr()`, `enumNum()`, etc.).
+
 ## Security
 
 All external input passes through `graphify/security.py` before use:

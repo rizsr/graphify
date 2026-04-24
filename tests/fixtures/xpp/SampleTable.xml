@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxTable xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+    <Name>SampleOrderTable</Name>
+    <SourceCode>
+        <Declaration><![CDATA[
+public class SampleOrderTable extends common
+{
+}
+]]></Declaration>
+        <Methods />
+    </SourceCode>
+    <Fields>
+        <AxTableField xmlns="" i:type="AxTableFieldString">
+            <Name>OrderId</Name>
+            <ExtendedDataType>SalesId</ExtendedDataType>
+        </AxTableField>
+        <AxTableField xmlns="" i:type="AxTableFieldReal">
+            <Name>TotalAmount</Name>
+            <ExtendedDataType>SalesAmount</ExtendedDataType>
+        </AxTableField>
+    </Fields>
+    <Indexes>
+        <AxTableIndex>
+            <Name>OrderIdx</Name>
+            <AlternateKey>Yes</AlternateKey>
+        </AxTableIndex>
+    </Indexes>
+    <Relations>
+        <AxTableRelation>
+            <Name>SalesTable</Name>
+            <Table>SalesTable</Table>
+        </AxTableRelation>
+    </Relations>
+</AxTable>

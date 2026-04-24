@@ -3196,6 +3196,613 @@ def _check_tree_sitter_version() -> None:
         )
 
 
+# ── X++ / D365 F&O XML metadata extractor ────────────────────────────────────
+
+import xml.etree.ElementTree as _ET
+import re as _re
+
+# Artifact tags that contain X++ source code CDATA sections
+_XPP_CODE_TAGS = frozenset({
+    "AxClass", "AxTable", "AxForm", "AxView",
+    "AxDataEntityView", "AxMap", "AxQuery",
+})
+
+# Extension artifact tags — name is "BaseName.ModelName"
+_XPP_EXTENSION_TAGS = frozenset({
+    "AxTableExtension", "AxFormExtension",
+    "AxDataEntityViewExtension", "AxViewExtension", "AxQuerySimpleExtension",
+    "AxEnumExtension",
+    "AxSecurityDutyExtension", "AxSecurityRoleExtension",
+})
+
+# Tags to skip entirely — no graph value
+_XPP_SKIP_TAGS = frozenset({
+    "AxRuleSet", "AxLabelFile", "AxIgnoreDiagnosticList", "AxReference",
+})
+
+# Regex patterns for X++ source code analysis
+_RE_EXTENDS     = _re.compile(r'\bextends\s+(\w+)')
+_RE_STATIC_CALL = _re.compile(r'\b([A-Z][A-Za-z0-9_]*)::(\w+)\s*\(')
+_RE_INSTANCE_CALL = _re.compile(r'\b(\w+)->(\w+)\s*\(')
+_RE_NEW_INST    = _re.compile(r'\bnew\s+([A-Z][A-Za-z0-9_]+)\s*\(')
+_RE_TABLE_STR   = _re.compile(r'\btablestr\s*\(\s*(\w+)\s*\)', _re.IGNORECASE)
+_RE_FIELD_STR   = _re.compile(r'\bfieldstr\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)', _re.IGNORECASE)
+_RE_ENUM_NUM    = _re.compile(r'\benumNum\s*\(\s*(\w+)\s*\)', _re.IGNORECASE)
+_RE_ENUM_STR    = _re.compile(r'\benumStr\s*\(\s*(\w+)\s*\)', _re.IGNORECASE)
+_RE_MENU_DISP   = _re.compile(r'\bmenuItemDisplayStr\s*\(\s*(\w+)\s*\)', _re.IGNORECASE)
+_RE_MENU_ACT    = _re.compile(r'\bmenuItemActionStr\s*\(\s*(\w+)\s*\)', _re.IGNORECASE)
+_RE_IDENTIFIER  = _re.compile(r'\bidentifierStr\s*\(\s*(\w+)\s*\)', _re.IGNORECASE)
+_RE_DATA_ENTITY_DS = _re.compile(r'\bdataEntityDataSourceStr\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)', _re.IGNORECASE)
+
+
+def _xpp_strip_ns(tag: str) -> str:
+    """Strip XML namespace from a tag: '{ns}LocalName' → 'LocalName'."""
+    return tag.split("}")[-1] if "}" in tag else tag
+
+
+def _xpp_find(root: _ET.Element, *tags: str) -> _ET.Element | None:
+    """Find first element matching any of the given local tag names (namespace-agnostic)."""
+    for elem in root.iter():
+        if _xpp_strip_ns(elem.tag) in tags:
+            return elem
+    return None
+
+
+def _xpp_findall(root: _ET.Element, tag: str) -> list[_ET.Element]:
+    """Find all elements matching the given local tag name (namespace-agnostic)."""
+    return [e for e in root.iter() if _xpp_strip_ns(e.tag) == tag]
+
+
+def _xpp_text(root: _ET.Element, *tags: str) -> str:
+    """Get text of the first matching element, or empty string."""
+    el = _xpp_find(root, *tags)
+    return (el.text or "").strip() if el is not None else ""
+
+
+def _xpp_node(nid: str, label: str, str_path: str, line: int = 1,
+               kind: str = "class") -> dict:
+    return {
+        "id": nid,
+        "label": label,
+        "source_file": str_path,
+        "source_location": f"L{line}",
+        "kind": kind,
+    }
+
+
+def _xpp_edge(src: str, tgt: str, relation: str, str_path: str,
+              line: int = 1, confidence: str = "EXTRACTED") -> dict:
+    return {
+        "source": src,
+        "target": tgt,
+        "relation": relation,
+        "confidence": confidence,
+        "confidence_score": 1.0 if confidence == "EXTRACTED" else 0.7,
+        "source_file": str_path,
+        "source_location": f"L{line}",
+        "weight": 1.0,
+    }
+
+
+def _parse_xpp_source(source_text: str, owner_id: str, str_path: str,
+                      nodes: list, edges: list, seen_ids: set) -> None:
+    """Extract edges from an X++ CDATA source block.
+
+    Parses static calls (::), instance calls (->), constructor calls (new),
+    table/field/enum intrinsic references, and menu item references.
+    """
+    if not source_text:
+        return
+
+    # Static calls: ClassName::method() — only track the target class, not the method
+    for m in _RE_STATIC_CALL.finditer(source_text):
+        target_class = m.group(1)
+        # Skip self-references and common compiler intrinsics
+        if target_class == owner_id.split("_")[0]:
+            continue
+        edges.append(_xpp_edge(owner_id, target_class, "calls", str_path, confidence="EXTRACTED"))
+
+    # Instance calls: var->method() — INFERRED (we don't know var's type)
+    for m in _RE_INSTANCE_CALL.finditer(source_text):
+        callee = m.group(2)
+        if callee and len(callee) > 2:
+            edges.append(_xpp_edge(owner_id, callee, "calls", str_path, confidence="INFERRED"))
+
+    # Constructor: new ClassName(
+    for m in _RE_NEW_INST.finditer(source_text):
+        edges.append(_xpp_edge(owner_id, m.group(1), "new_instance", str_path, confidence="INFERRED"))
+
+    # Table references: tableStr(TableName) / tablestr(TableName)
+    for m in _RE_TABLE_STR.finditer(source_text):
+        edges.append(_xpp_edge(owner_id, m.group(1), "uses_table", str_path))
+
+    # Field references: fieldStr(Table, Field)
+    for m in _RE_FIELD_STR.finditer(source_text):
+        tbl_field = f"{m.group(1)}_{m.group(2)}"
+        edges.append(_xpp_edge(owner_id, tbl_field, "uses_field", str_path))
+
+    # Enum references: enumNum(EnumName) / enumStr(EnumName)
+    for m in _RE_ENUM_NUM.finditer(source_text):
+        edges.append(_xpp_edge(owner_id, m.group(1), "references_enum", str_path))
+    for m in _RE_ENUM_STR.finditer(source_text):
+        edges.append(_xpp_edge(owner_id, m.group(1), "references_enum", str_path))
+
+    # Menu item references
+    for m in _RE_MENU_DISP.finditer(source_text):
+        edges.append(_xpp_edge(owner_id, m.group(1), "opens_form", str_path, confidence="INFERRED"))
+    for m in _RE_MENU_ACT.finditer(source_text):
+        edges.append(_xpp_edge(owner_id, m.group(1), "runs_class", str_path, confidence="INFERRED"))
+
+
+def _xpp_extract_methods(source_code_el: _ET.Element | None,
+                          owner_id: str, owner_name: str, str_path: str,
+                          nodes: list, edges: list, seen_ids: set) -> None:
+    """Extract method nodes and their call edges from a SourceCode element."""
+    if source_code_el is None:
+        return
+
+    # Extract parent class from Declaration CDATA
+    decl_el = _xpp_find(source_code_el, "Declaration")
+    if decl_el is not None and decl_el.text:
+        m = _RE_EXTENDS.search(decl_el.text)
+        if m:
+            parent = m.group(1)
+            if parent not in ("common", "FormRun", "QueryRun") and parent != owner_name:
+                edges.append(_xpp_edge(owner_id, parent, "extends", str_path))
+
+    # Extract methods
+    for method_el in _xpp_findall(source_code_el, "Method"):
+        method_name = _xpp_text(method_el, "Name")
+        if not method_name or method_name == "classDeclaration":
+            continue
+        method_id = _make_id(owner_id, method_name)
+        if method_id not in seen_ids:
+            seen_ids.add(method_id)
+            nodes.append(_xpp_node(method_id, f"{method_name}()", str_path, kind="method"))
+        edges.append(_xpp_edge(owner_id, method_id, "defines_method", str_path))
+
+        source_el = _xpp_find(method_el, "Source")
+        if source_el is not None and source_el.text:
+            _parse_xpp_source(source_el.text, method_id, str_path, nodes, edges, seen_ids)
+
+
+def _extract_xpp_code_artifact(root: _ET.Element, artifact_tag: str,
+                                str_path: str) -> dict:
+    """Handle Tier-1 code artifacts: AxClass, AxTable, AxForm, AxView,
+    AxDataEntityView, AxMap, AxQuery."""
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    seen_ids: set[str] = set()
+
+    name = _xpp_text(root, "Name")
+    if not name:
+        return {"nodes": [], "edges": [], "raw_calls": [], "input_tokens": 0, "output_tokens": 0}
+
+    nid = _make_id(name)
+    if nid not in seen_ids:
+        seen_ids.add(nid)
+        nodes.append(_xpp_node(nid, name, str_path, kind=artifact_tag.lower()))
+
+    source_code_el = _xpp_find(root, "SourceCode")
+    _xpp_extract_methods(source_code_el, nid, name, str_path, nodes, edges, seen_ids)
+
+    # AxTable/AxView/AxDataEntityView: extract fields and relations
+    if artifact_tag in ("AxTable", "AxView", "AxDataEntityView", "AxMap"):
+        for field_el in _xpp_findall(root, "AxTableField"):
+            field_name = _xpp_text(field_el, "Name")
+            if field_name:
+                fid = _make_id(nid, field_name)
+                if fid not in seen_ids:
+                    seen_ids.add(fid)
+                    nodes.append(_xpp_node(fid, field_name, str_path, kind="field"))
+                edges.append(_xpp_edge(nid, fid, "field_of", str_path))
+                edt = _xpp_text(field_el, "ExtendedDataType")
+                if edt:
+                    edges.append(_xpp_edge(fid, _make_id(edt), "edt_type", str_path))
+
+        # View fields
+        for field_el in _xpp_findall(root, "AxViewField"):
+            field_name = _xpp_text(field_el, "Name")
+            if field_name:
+                fid = _make_id(nid, field_name)
+                if fid not in seen_ids:
+                    seen_ids.add(fid)
+                    nodes.append(_xpp_node(fid, field_name, str_path, kind="field"))
+                edges.append(_xpp_edge(nid, fid, "field_of", str_path))
+
+        for idx_el in _xpp_findall(root, "AxTableIndex"):
+            idx_name = _xpp_text(idx_el, "Name")
+            if idx_name:
+                iid = _make_id(nid, idx_name)
+                if iid not in seen_ids:
+                    seen_ids.add(iid)
+                    nodes.append(_xpp_node(iid, idx_name, str_path, kind="index"))
+                edges.append(_xpp_edge(nid, iid, "index_on", str_path))
+
+        for rel_el in _xpp_findall(root, "AxTableRelation"):
+            rel_table = _xpp_text(rel_el, "Table")
+            if rel_table:
+                edges.append(_xpp_edge(nid, _make_id(rel_table), "relation_to", str_path))
+
+    # AxQuery: extract data source tree (recursive)
+    if artifact_tag == "AxQuery":
+        def _walk_ds(ds_el: _ET.Element) -> None:
+            table_name = _xpp_text(ds_el, "Table")
+            if table_name:
+                edges.append(_xpp_edge(nid, _make_id(table_name), "data_source", str_path))
+                join_mode = _xpp_text(ds_el, "JoinMode")
+                if join_mode:
+                    edges.append(_xpp_edge(nid, _make_id(table_name), "join", str_path))
+            # Only iterate direct child data sources to avoid re-walking all descendants
+            for child in ds_el:
+                child_tag = _xpp_strip_ns(child.tag)
+                if child_tag == "DataSources":
+                    for embedded in child:
+                        emb_tag = _xpp_strip_ns(embedded.tag)
+                        if emb_tag in ("AxQuerySimpleEmbeddedDataSource",
+                                       "AxQuerySimpleRootDataSource"):
+                            _walk_ds(embedded)
+
+        for root_ds in _xpp_findall(root, "AxQuerySimpleRootDataSource"):
+            _walk_ds(root_ds)
+
+    return {"nodes": nodes, "edges": edges, "raw_calls": [], "input_tokens": 0, "output_tokens": 0}
+
+
+def _extract_xpp_extension(root: _ET.Element, artifact_tag: str,
+                            str_path: str) -> dict:
+    """Handle Tier-2 extension artifacts. Name is 'BaseName.ModelName'."""
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    seen_ids: set[str] = set()
+
+    full_name = _xpp_text(root, "Name")
+    if not full_name:
+        return {"nodes": [], "edges": [], "raw_calls": [], "input_tokens": 0, "output_tokens": 0}
+
+    # Split on last dot to get base artifact name
+    if "." in full_name:
+        base_name = full_name.rsplit(".", 1)[0]
+    else:
+        base_name = full_name
+
+    nid = _make_id(full_name)
+    if nid not in seen_ids:
+        seen_ids.add(nid)
+        nodes.append(_xpp_node(nid, full_name, str_path, kind=artifact_tag.lower()))
+
+    base_nid = _make_id(base_name)
+    edges.append(_xpp_edge(nid, base_nid, "extends", str_path))
+
+    # AxTableExtension: extract added fields
+    if artifact_tag == "AxTableExtension":
+        for field_el in _xpp_findall(root, "AxTableField"):
+            field_name = _xpp_text(field_el, "Name")
+            if field_name:
+                fid = _make_id(nid, field_name)
+                if fid not in seen_ids:
+                    seen_ids.add(fid)
+                    nodes.append(_xpp_node(fid, field_name, str_path, kind="field"))
+                edges.append(_xpp_edge(nid, fid, "field_of", str_path))
+                edt = _xpp_text(field_el, "ExtendedDataType")
+                if edt:
+                    edges.append(_xpp_edge(fid, _make_id(edt), "edt_type", str_path))
+        for rel_el in _xpp_findall(root, "AxTableRelation"):
+            rel_table = _xpp_text(rel_el, "Table")
+            if rel_table:
+                edges.append(_xpp_edge(nid, _make_id(rel_table), "relation_to", str_path))
+
+    # AxFormExtension: extract menu item references from added controls
+    if artifact_tag == "AxFormExtension":
+        for ctrl_el in _xpp_findall(root, "AxFormControl"):
+            menu_item = _xpp_text(ctrl_el, "MenuItemName")
+            if menu_item:
+                edges.append(_xpp_edge(nid, _make_id(menu_item), "opens_form", str_path,
+                                       confidence="INFERRED"))
+
+        # Methods on form extensions
+        source_code_el = _xpp_find(root, "SourceCode")
+        _xpp_extract_methods(source_code_el, nid, full_name, str_path, nodes, edges, seen_ids)
+
+    return {"nodes": nodes, "edges": edges, "raw_calls": [], "input_tokens": 0, "output_tokens": 0}
+
+
+def _extract_xpp_enum(root: _ET.Element, artifact_tag: str, str_path: str) -> dict:
+    """Handle AxEnum and AxEnumExtension."""
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    seen_ids: set[str] = set()
+
+    full_name = _xpp_text(root, "Name")
+    if not full_name:
+        return {"nodes": [], "edges": [], "raw_calls": [], "input_tokens": 0, "output_tokens": 0}
+
+    nid = _make_id(full_name)
+    if nid not in seen_ids:
+        seen_ids.add(nid)
+        nodes.append(_xpp_node(nid, full_name, str_path, kind="enum"))
+
+    if artifact_tag == "AxEnumExtension" and "." in full_name:
+        base_name = full_name.rsplit(".", 1)[0]
+        edges.append(_xpp_edge(nid, _make_id(base_name), "extends", str_path))
+
+    for val_el in _xpp_findall(root, "AxEnumValue"):
+        val_name = _xpp_text(val_el, "Name")
+        if val_name:
+            vid = _make_id(nid, val_name)
+            if vid not in seen_ids:
+                seen_ids.add(vid)
+                nodes.append(_xpp_node(vid, val_name, str_path, kind="enum_value"))
+            edges.append(_xpp_edge(nid, vid, "value_of", str_path))
+
+    return {"nodes": nodes, "edges": edges, "raw_calls": [], "input_tokens": 0, "output_tokens": 0}
+
+
+def _extract_xpp_security(root: _ET.Element, artifact_tag: str, str_path: str) -> dict:
+    """Handle AxSecurityPrivilege, AxSecurityDuty, AxSecurityRole and their extensions."""
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    seen_ids: set[str] = set()
+
+    full_name = _xpp_text(root, "Name")
+    if not full_name:
+        return {"nodes": [], "edges": [], "raw_calls": [], "input_tokens": 0, "output_tokens": 0}
+
+    nid = _make_id(full_name)
+    if nid not in seen_ids:
+        seen_ids.add(nid)
+        nodes.append(_xpp_node(nid, full_name, str_path, kind=artifact_tag.lower()))
+
+    # Extensions: resolve base name
+    if artifact_tag in ("AxSecurityDutyExtension", "AxSecurityRoleExtension") and "." in full_name:
+        base_name = full_name.rsplit(".", 1)[0]
+        edges.append(_xpp_edge(nid, _make_id(base_name), "extends", str_path))
+
+    if artifact_tag == "AxSecurityPrivilege":
+        for perm_el in _xpp_findall(root, "AxSecurityDataEntityPermission"):
+            entity_name = _xpp_text(perm_el, "Name")
+            if entity_name:
+                edges.append(_xpp_edge(nid, _make_id(entity_name), "grants_access_to", str_path))
+
+    if artifact_tag == "AxSecurityDuty":
+        for priv_el in _xpp_findall(root, "AxSecurityPrivilegeReference"):
+            priv_name = _xpp_text(priv_el, "Name")
+            if priv_name:
+                edges.append(_xpp_edge(nid, _make_id(priv_name), "includes_privilege", str_path))
+
+    if artifact_tag == "AxSecurityRole":
+        for duty_el in _xpp_findall(root, "AxSecurityDutyReference"):
+            duty_name = _xpp_text(duty_el, "Name")
+            if duty_name:
+                edges.append(_xpp_edge(nid, _make_id(duty_name), "has_duty", str_path))
+        for priv_el in _xpp_findall(root, "AxSecurityPrivilegeReference"):
+            priv_name = _xpp_text(priv_el, "Name")
+            if priv_name:
+                edges.append(_xpp_edge(nid, _make_id(priv_name), "has_privilege", str_path))
+        for sub_el in _xpp_findall(root, "AxSecuritySubRoleReference"):
+            sub_name = _xpp_text(sub_el, "Name")
+            if sub_name:
+                edges.append(_xpp_edge(nid, _make_id(sub_name), "has_sub_role", str_path))
+
+    return {"nodes": nodes, "edges": edges, "raw_calls": [], "input_tokens": 0, "output_tokens": 0}
+
+
+def _extract_xpp_ui(root: _ET.Element, artifact_tag: str, str_path: str) -> dict:
+    """Handle AxMenuItemDisplay/Action/Output, AxMenuExtension, AxTile."""
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    seen_ids: set[str] = set()
+
+    full_name = _xpp_text(root, "Name")
+    if not full_name:
+        return {"nodes": [], "edges": [], "raw_calls": [], "input_tokens": 0, "output_tokens": 0}
+
+    nid = _make_id(full_name)
+    if nid not in seen_ids:
+        seen_ids.add(nid)
+        nodes.append(_xpp_node(nid, full_name, str_path, kind=artifact_tag.lower()))
+
+    if artifact_tag == "AxMenuItemDisplay":
+        obj = _xpp_text(root, "Object")
+        if obj:
+            edges.append(_xpp_edge(nid, _make_id(obj), "opens_form", str_path))
+        config_key = _xpp_text(root, "ConfigurationKey")
+        if config_key:
+            edges.append(_xpp_edge(nid, _make_id(config_key), "requires_config", str_path,
+                                   confidence="INFERRED"))
+
+    elif artifact_tag == "AxMenuItemAction":
+        obj = _xpp_text(root, "Object")
+        if obj:
+            edges.append(_xpp_edge(nid, _make_id(obj), "runs_class", str_path))
+
+    elif artifact_tag == "AxMenuItemOutput":
+        obj = _xpp_text(root, "Object")
+        if obj:
+            edges.append(_xpp_edge(nid, _make_id(obj), "opens_report", str_path))
+
+    elif artifact_tag == "AxMenuExtension":
+        if "." in full_name:
+            base_name = full_name.rsplit(".", 1)[0]
+            edges.append(_xpp_edge(nid, _make_id(base_name), "extends", str_path))
+        for tile_el in _xpp_findall(root, "AxMenuElement"):
+            tile_ref = _xpp_text(tile_el, "Tile")
+            if tile_ref:
+                edges.append(_xpp_edge(nid, _make_id(tile_ref), "includes_tile", str_path))
+            menu_ref = _xpp_text(tile_el, "MenuItemName")
+            if menu_ref:
+                edges.append(_xpp_edge(nid, _make_id(menu_ref), "includes_item", str_path))
+
+    elif artifact_tag == "AxTile":
+        menu_item = _xpp_text(root, "MenuItemName")
+        if menu_item:
+            edges.append(_xpp_edge(nid, _make_id(menu_item), "launches", str_path))
+
+    return {"nodes": nodes, "edges": edges, "raw_calls": [], "input_tokens": 0, "output_tokens": 0}
+
+
+def _extract_xpp_service(root: _ET.Element, artifact_tag: str, str_path: str) -> dict:
+    """Handle AxService and AxServiceGroup."""
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    seen_ids: set[str] = set()
+
+    full_name = _xpp_text(root, "Name")
+    if not full_name:
+        return {"nodes": [], "edges": [], "raw_calls": [], "input_tokens": 0, "output_tokens": 0}
+
+    nid = _make_id(full_name)
+    if nid not in seen_ids:
+        seen_ids.add(nid)
+        nodes.append(_xpp_node(nid, full_name, str_path, kind=artifact_tag.lower()))
+
+    if artifact_tag == "AxService":
+        impl_class = _xpp_text(root, "Class")
+        if impl_class:
+            edges.append(_xpp_edge(nid, _make_id(impl_class), "implemented_by", str_path))
+        for op_el in _xpp_findall(root, "AxServiceOperation"):
+            op_name = _xpp_text(op_el, "Name")
+            method_name = _xpp_text(op_el, "Method")
+            if op_name and method_name and impl_class:
+                method_id = _make_id(impl_class, method_name)
+                edges.append(_xpp_edge(nid, method_id, "exposes_method", str_path,
+                                       confidence="INFERRED"))
+
+    elif artifact_tag == "AxServiceGroup":
+        for svc_el in _xpp_findall(root, "AxServiceReference"):
+            svc_name = _xpp_text(svc_el, "Name")
+            if svc_name:
+                edges.append(_xpp_edge(nid, _make_id(svc_name), "includes_service", str_path))
+
+    return {"nodes": nodes, "edges": edges, "raw_calls": [], "input_tokens": 0, "output_tokens": 0}
+
+
+def _extract_xpp_bi(root: _ET.Element, artifact_tag: str, str_path: str) -> dict:
+    """Handle AxAggregateMeasurement, AxAggregateDimension, AxAggregateDataEntity, AxKPI."""
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    seen_ids: set[str] = set()
+
+    full_name = _xpp_text(root, "Name")
+    if not full_name:
+        return {"nodes": [], "edges": [], "raw_calls": [], "input_tokens": 0, "output_tokens": 0}
+
+    nid = _make_id(full_name)
+    if nid not in seen_ids:
+        seen_ids.add(nid)
+        nodes.append(_xpp_node(nid, full_name, str_path, kind=artifact_tag.lower()))
+
+    if artifact_tag == "AxAggregateMeasurement":
+        for mg_el in _xpp_findall(root, "AxMeasureGroup"):
+            mg_name = _xpp_text(mg_el, "Name")
+            if mg_name:
+                mgid = _make_id(nid, mg_name)
+                if mgid not in seen_ids:
+                    seen_ids.add(mgid)
+                    nodes.append(_xpp_node(mgid, mg_name, str_path, kind="measure_group"))
+                edges.append(_xpp_edge(nid, mgid, "measure_group_of", str_path))
+                tbl = _xpp_text(mg_el, "Table")
+                if tbl:
+                    edges.append(_xpp_edge(mgid, _make_id(tbl), "uses_table", str_path))
+                for dim_el in _xpp_findall(mg_el, "AxDimension"):
+                    dim_name = _xpp_text(dim_el, "DimensionName")
+                    if dim_name:
+                        edges.append(_xpp_edge(mgid, _make_id(dim_name), "has_dimension",
+                                               str_path))
+
+    elif artifact_tag == "AxAggregateDimension":
+        tbl = _xpp_text(root, "Table")
+        if tbl:
+            edges.append(_xpp_edge(nid, _make_id(tbl), "backed_by", str_path))
+
+    elif artifact_tag == "AxKPI":
+        measurement = _xpp_text(root, "Measurement")
+        if measurement:
+            edges.append(_xpp_edge(nid, _make_id(measurement), "measures_from", str_path))
+        mg = _xpp_text(root, "MeasureGroup")
+        if mg:
+            edges.append(_xpp_edge(nid, _make_id(mg), "uses_measure_group", str_path,
+                                   confidence="INFERRED"))
+
+    return {"nodes": nodes, "edges": edges, "raw_calls": [], "input_tokens": 0, "output_tokens": 0}
+
+
+def _extract_xpp_metadata(root: _ET.Element, artifact_tag: str, str_path: str) -> dict:
+    """Handle node-only metadata artifacts: AxConfigurationKey, AxReport, AxResource,
+    AxMacroDictionary, AxEdt."""
+    full_name = _xpp_text(root, "Name")
+    if not full_name:
+        return {"nodes": [], "edges": [], "raw_calls": [], "input_tokens": 0, "output_tokens": 0}
+    nid = _make_id(full_name)
+    node = _xpp_node(nid, full_name, str_path, kind=artifact_tag.lower())
+
+    # AxEdt: track table references
+    edges: list[dict] = []
+    if artifact_tag == "AxEdt":
+        for tr_el in _xpp_findall(root, "AxEdtTableReference"):
+            tbl = _xpp_text(tr_el, "Table")
+            if tbl:
+                edges.append(_xpp_edge(nid, _make_id(tbl), "table_reference", str_path,
+                                       confidence="INFERRED"))
+
+    return {"nodes": [node], "edges": edges, "raw_calls": [], "input_tokens": 0, "output_tokens": 0}
+
+
+def extract_xpp(path: Path) -> dict:
+    """Extract nodes and edges from a D365 F&O X++ XML metadata file.
+
+    Dispatches to a per-artifact-type handler based on the XML root element tag.
+    Returns the standard graphify extraction dict: nodes, edges, raw_calls.
+    """
+    str_path = str(path)
+    try:
+        tree = _ET.parse(str_path)
+        root = tree.getroot()
+    except _ET.ParseError as exc:
+        return {"error": f"XML parse error: {exc}", "nodes": [], "edges": [],
+                "raw_calls": [], "input_tokens": 0, "output_tokens": 0}
+
+    artifact_tag = _xpp_strip_ns(root.tag)
+
+    # Skip noisy artifact types with no graph value
+    if artifact_tag in _XPP_SKIP_TAGS:
+        return {"nodes": [], "edges": [], "raw_calls": [], "input_tokens": 0, "output_tokens": 0}
+
+    if artifact_tag in _XPP_CODE_TAGS:
+        return _extract_xpp_code_artifact(root, artifact_tag, str_path)
+
+    if artifact_tag in _XPP_EXTENSION_TAGS:
+        return _extract_xpp_extension(root, artifact_tag, str_path)
+
+    if artifact_tag in ("AxEnum", "AxEnumExtension"):
+        return _extract_xpp_enum(root, artifact_tag, str_path)
+
+    if artifact_tag in ("AxSecurityPrivilege", "AxSecurityDuty", "AxSecurityRole",
+                        "AxSecurityDutyExtension", "AxSecurityRoleExtension"):
+        return _extract_xpp_security(root, artifact_tag, str_path)
+
+    if artifact_tag in ("AxMenuItemDisplay", "AxMenuItemAction", "AxMenuItemOutput",
+                        "AxMenuExtension", "AxTile"):
+        return _extract_xpp_ui(root, artifact_tag, str_path)
+
+    if artifact_tag in ("AxService", "AxServiceGroup"):
+        return _extract_xpp_service(root, artifact_tag, str_path)
+
+    if artifact_tag in ("AxAggregateMeasurement", "AxAggregateDimension",
+                        "AxAggregateDataEntity", "AxKPI"):
+        return _extract_xpp_bi(root, artifact_tag, str_path)
+
+    if artifact_tag in ("AxConfigurationKey", "AxReport", "AxResource",
+                        "AxMacroDictionary", "AxEdt"):
+        return _extract_xpp_metadata(root, artifact_tag, str_path)
+
+    # Unknown Ax* tag — return empty gracefully
+    return {"nodes": [], "edges": [], "raw_calls": [], "input_tokens": 0, "output_tokens": 0}
+
+
+# ── End X++ extractor ─────────────────────────────────────────────────────────
+
+
 def extract(paths: list[Path], cache_root: Path | None = None) -> dict:
     """Extract AST nodes and edges from a list of code files.
 
@@ -3279,6 +3886,10 @@ def extract(paths: list[Path], cache_root: Path | None = None) -> dict:
         # .blade.php must be checked before suffix lookup since Path.suffix returns .php
         if path.name.endswith(".blade.php"):
             extractor = extract_blade
+        elif path.suffix == ".xml":
+            # .xml files are only collected when is_xpp_file() returned True,
+            # so we can route them directly to the X++ extractor.
+            extractor = extract_xpp
         else:
             extractor = _DISPATCH.get(path.suffix)
         if extractor is None:
@@ -3390,13 +4001,19 @@ def collect_files(target: Path, *, follow_symlinks: bool = False, root: Path | N
         ".rb", ".cs", ".kt", ".kts", ".scala", ".php", ".swift",
         ".lua", ".toc", ".zig", ".ps1",
         ".m", ".mm",
+        ".xml",  # D365 F&O X++ metadata (filtered by is_xpp_file below)
     }
-    from graphify.detect import _load_graphifyignore, _is_ignored
+    from graphify.detect import _load_graphifyignore, _is_ignored, is_xpp_file
     ignore_root = root if root is not None else target
     patterns = _load_graphifyignore(ignore_root)
 
     def _ignored(p: Path) -> bool:
         return bool(patterns and _is_ignored(p, ignore_root, patterns))
+
+    def _include(p: Path) -> bool:
+        if p.suffix == ".xml":
+            return is_xpp_file(p)
+        return True
 
     if not follow_symlinks:
         results: list[Path] = []
@@ -3405,6 +4022,7 @@ def collect_files(target: Path, *, follow_symlinks: bool = False, root: Path | N
                 p for p in target.rglob(f"*{ext}")
                 if not any(part.startswith(".") for part in p.parts)
                 and not _ignored(p)
+                and _include(p)
             )
         return sorted(results)
     # Walk with symlink following + cycle detection
@@ -3422,7 +4040,7 @@ def collect_files(target: Path, *, follow_symlinks: bool = False, root: Path | N
             continue
         for fname in filenames:
             p = dp / fname
-            if p.suffix in _EXTENSIONS and not fname.startswith(".") and not _ignored(p):
+            if p.suffix in _EXTENSIONS and not fname.startswith(".") and not _ignored(p) and _include(p):
                 results.append(p)
     return sorted(results)
 

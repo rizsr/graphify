@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AxClass xmlns:i="http://www.w3.org/2001/XMLSchema-instance">
+    <Name>SampleOrderProcessor</Name>
+    <SourceCode>
+        <Declaration><![CDATA[
+public class SampleOrderProcessor extends SampleBaseProcessor
+{
+}
+]]></Declaration>
+        <Methods>
+            <Method>
+                <Name>processOrder</Name>
+                <Source><![CDATA[
+    public static void processOrder(SalesTable _salesTable)
+    {
+        SampleValidator::validate(_salesTable);
+        SampleLogger::log(tableStr(SalesTable), fieldStr(SalesTable, SalesId));
+        SampleEnum status = any2Enum(enumNum(SampleStatus), 1);
+    }
+]]></Source>
+            </Method>
+            <Method>
+                <Name>createInstance</Name>
+                <Source><![CDATA[
+    public static SampleOrderProcessor createInstance()
+    {
+        SampleOrderProcessor processor = new SampleOrderProcessor();
+        return processor;
+    }
+]]></Source>
+            </Method>
+        </Methods>
+    </SourceCode>
+</AxClass>
