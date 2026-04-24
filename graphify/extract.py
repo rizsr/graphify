@@ -3264,6 +3264,7 @@ def _xpp_node(nid: str, label: str, str_path: str, line: int = 1,
     return {
         "id": nid,
         "label": label,
+        "file_type": "code",
         "source_file": str_path,
         "source_location": f"L{line}",
         "kind": kind,
